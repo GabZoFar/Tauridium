@@ -12,6 +12,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-08-21
+### Fixed
+- **Linux: service webview covered the sidebar and only took half the height.**
+  On Linux, Tauri packs the main webview and every `add_child` service webview
+  into the same `GtkBox`, which evenly splits its height between them and
+  stretches each to the full width — hiding the sidebar and leaving the service
+  short of the window bottom. Vendored wry now nests a shared `GtkFixed` inside
+  the box so webviews can overlap and be positioned (matching macOS/Windows).
+
 ## [0.1.10] - 2026-07-10
 ### Fixed
 - **Doubled keystrokes in Discord's channel search.** On macOS, WKWebView
