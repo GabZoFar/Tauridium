@@ -595,10 +595,72 @@ impl InnerWebView {
 
     let container_type = container.type_().name();
     if container_type == "GtkBox" {
-      container
-        .dynamic_cast_ref::<gtk::Box>()
-        .unwrap()
-        .pack_start(webview, true, true, 0);
+      // Tauri (2.x) uses the window's default_vbox (a GtkBox) as the container for
+      // BOTH the main webview and any add_child() webviews. GtkBox splits its space
+      // between children — so with N webviews you get N slices instead of overlapping
+      // views like on macOS / Windows. To match those platforms, we nest a shared
+      // GtkFixed inside the vbox (created on first use) and put every webview in it.
+      // Positioning via set_bounds() then works, because GtkFixed allows overlap and
+      // arbitrary positions.
+      let box_ = container.dynamic_cast_ref::<gtk::Box>().unwrap();
+
+      // Find an existing wry-managed GtkFixed inside the vbox, or create one.
+      const FIXED_MARKER: &str = "wry-multiwebview-fixed";
+      let fixed = box_
+        .children()
+        .into_iter()
+        .filter_map(|c| c.dynamic_cast::<gtk::Fixed>().ok())
+        .find(|f| f.widget_name() == FIXED_MARKER);
+      let fixed = if let Some(f) = fixed {
+        f
+      } else {
+        let f = gtk::Fixed::new();
+        f.set_widget_name(FIXED_MARKER);
+        box_.pack_start(&f, true, true, 0);
+        f.show();
+
+        // GtkFixed doesn't auto-resize its children. Any webview added without
+        // explicit bounds (i.e. the main webview) should fill the container — so
+        // whenever our GtkFixed is (re)allocated a new size, re-size all children
+        // that opted into "fill" mode.
+        f.connect_size_allocate(|f, alloc| {
+          for child in f.children() {
+            if child.widget_name() == "wry-fill-child" {
+              child.size_allocate(&gtk::Allocation::new(
+                0,
+                0,
+                alloc.width().max(1),
+                alloc.height().max(1),
+              ));
+            }
+          }
+        });
+        f
+      };
+
+      let scale_factor = webview.scale_factor() as f64;
+      let has_bounds = attributes.bounds.is_some();
+      let (width, height) = attributes
+        .bounds
+        .map(|b| b.size.to_logical::<i32>(scale_factor))
+        .map(Into::into)
+        .unwrap_or_else(|| {
+          let a = fixed.allocation();
+          (a.width().max(1), a.height().max(1))
+        });
+      let (x, y) = attributes
+        .bounds
+        .map(|b| b.position.to_logical::<i32>(scale_factor))
+        .map(Into::into)
+        .unwrap_or((0, 0));
+
+      if !has_bounds {
+        // No bounds → the caller wants this webview to fill (main webview case).
+        webview.set_widget_name("wry-fill-child");
+      }
+      webview.set_size_request(width, height);
+      fixed.put(webview, x, y);
+      is_in_fixed_parent = true;
     } else if container_type == "GtkFixed" {
       let scale_factor = webview.scale_factor() as f64;
       let (width, height) = attributes
