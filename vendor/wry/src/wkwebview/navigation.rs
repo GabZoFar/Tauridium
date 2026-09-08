@@ -1,5 +1,5 @@
 use objc2::DeclaredClass;
-use objc2_foundation::{NSObjectProtocol, NSString};
+use objc2_foundation::{NSHTTPURLResponse, NSObjectProtocol, NSString};
 use objc2_web_kit::{
   WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationResponse,
   WKNavigationResponsePolicy,
@@ -92,7 +92,25 @@ pub(crate) fn navigation_policy_response(
   unsafe {
     let can_show_mime_type = response.canShowMIMEType();
 
-    if !can_show_mime_type {
+    // Patch Tauridium : contrairement à Safari, WKWebView n'honore pas
+    // `Content-Disposition: attachment` — dès qu'il sait rendre le type MIME (PDF, image,
+    // texte, CSV…) il AFFICHE le fichier au lieu de le télécharger, ce qui remplace la page
+    // du service (cf. téléchargement d'un fichier depuis ChatGPT) sans moyen de revenir.
+    // On traite donc un `attachment` comme un téléchargement, quel que soit le type MIME.
+    let is_attachment = response
+      .response()
+      .downcast::<NSHTTPURLResponse>()
+      .ok()
+      .and_then(|r| r.valueForHTTPHeaderField(&NSString::from_str("Content-Disposition")))
+      .map(|v| {
+        v.to_string()
+          .trim_start()
+          .to_ascii_lowercase()
+          .starts_with("attachment")
+      })
+      .unwrap_or(false);
+
+    if !can_show_mime_type || is_attachment {
       let has_download_handler = this.ivars().has_download_handler;
       if has_download_handler {
         (*handler).call((WKNavigationResponsePolicy::Download,));

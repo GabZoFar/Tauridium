@@ -30,7 +30,10 @@ tauri-plugin-dialog = "2"
 name = "tauridium"
 path = "src/main.rs"
 
-# wry patché : window.ipc mutable pour injecter le shim IPC Electron (cf. Synology Chat).
-# Voir vendor/wry/src/wkwebview/mod.rs. À ré-appliquer en cas de montée de version de wry.
+# wry patché. À ré-appliquer en cas de montée de version de wry :
+#  - window.ipc mutable pour injecter le shim IPC Electron (cf. Synology Chat), dans
+#    vendor/wry/src/wkwebview/mod.rs ;
+#  - `Content-Disposition: attachment` traité comme un téléchargement sous WKWebView, dans
+#    vendor/wry/src/wkwebview/navigation.rs.
 [patch.crates-io]
 wry = { path = "../vendor/wry" }

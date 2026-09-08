@@ -18,7 +18,7 @@ use std::time::Duration;
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{
-    DownloadEvent, NewWindowFeatures, NewWindowResponse, PageLoadEvent, WebviewBuilder,
+    DownloadEvent, NewWindowFeatures, NewWindowResponse, PageLoadEvent, Webview, WebviewBuilder,
 };
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
@@ -38,6 +38,12 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .unwrap_or_default()
 });
+
+// Nom de fichier retenu pour chaque téléchargement en cours (clé : URL d'origine).
+// `DownloadEvent::Finished` ne donne pas le chemin sur macOS et l'URL ne permet pas de le
+// reconstituer -> on mémorise le nom choisi à la demande pour nommer la notification.
+static DOWNLOAD_NAMES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // User-agent pour les appels API serveur Ferdium / récupération des recipes.
 const API_UA: &str = concat!("Tauridium/", env!("CARGO_PKG_VERSION"));
@@ -112,6 +118,7 @@ struct AppState {
     sidebar_w: Mutex<f64>,           // largeur de la sidebar (init en setup, def. 240)
     desired_active: Mutex<Option<String>>, // dernier service demandé (anti vol de focus au switch)
     inflight: Mutex<HashSet<String>>, // webviews en cours de création (anti double add_child)
+    homes: Mutex<HashMap<String, String>>, // URL d'origine par service (menu « Home »)
 }
 
 #[derive(Clone, Copy)]
@@ -834,30 +841,60 @@ async fn create_service_webview(
             serde_json::json!({ "id": sid_evt, "status": status }),
         );
     });
-    // Téléchargements (clic droit « Download », liens `download`…) : WKWebView n'a pas de
-    // gestion par défaut -> rien ne se passe. On enregistre dans le dossier Téléchargements
-    // et on notifie à la fin (sur macOS le chemin final n'est pas exposé par l'API).
+    // Téléchargements (clic droit « Download », liens `download`, réponses en
+    // `Content-Disposition: attachment`) : WKWebView n'a pas de gestion par défaut -> rien
+    // ne se passe. On enregistre dans le dossier Téléchargements et on notifie à la fin
+    // (sur macOS le chemin final n'est pas exposé par l'API).
     builder = builder.on_download(|webview, event| {
         match event {
             DownloadEvent::Requested { url, destination } => {
-                let dir = webview
-                    .app_handle()
-                    .path()
-                    .download_dir()
-                    .or_else(|_| webview.app_handle().path().home_dir())
-                    .unwrap_or_else(|_| PathBuf::from("."));
-                *destination = unique_download_path(&dir, &download_filename(&url));
+                // wry propose déjà « <Téléchargements>/<nom suggéré> », et ce nom suggéré
+                // vient du `Content-Disposition` : c'est la seule source fiable quand l'URL
+                // n'en porte pas (les liens signés de ChatGPT finissent par « file-xxx »,
+                // sans extension). On ne retombe sur l'URL que si elle est inexploitable.
+                let name = destination
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty() && *n != "Unknown")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| download_filename(&url));
+                let dir = destination
+                    .parent()
+                    .filter(|p| p.is_dir())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| {
+                        webview
+                            .app_handle()
+                            .path()
+                            .download_dir()
+                            .or_else(|_| webview.app_handle().path().home_dir())
+                            .unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                let path = unique_download_path(&dir, &name);
+                if let Some(final_name) = path.file_name().and_then(|n| n.to_str()) {
+                    DOWNLOAD_NAMES
+                        .lock()
+                        .unwrap()
+                        .insert(url.to_string(), final_name.to_string());
+                }
+                *destination = path;
             }
-            DownloadEvent::Finished {
-                url, success: true, ..
-            } => {
-                let _ = webview
-                    .app_handle()
-                    .notification()
-                    .builder()
-                    .title("Tauridium")
-                    .body(format!("« {} » téléchargé", download_filename(&url)))
-                    .show();
+            DownloadEvent::Finished { url, success, .. } => {
+                let name = DOWNLOAD_NAMES
+                    .lock()
+                    .unwrap()
+                    .remove(url.as_str())
+                    .unwrap_or_else(|| download_filename(&url));
+                if success {
+                    let _ = webview
+                        .app_handle()
+                        .notification()
+                        .builder()
+                        .title("Tauridium")
+                        .body(format!("« {name} » téléchargé"))
+                        .show();
+                }
             }
             _ => {}
         }
@@ -890,6 +927,12 @@ async fn create_service_webview(
     win.add_child(builder, pos, size)
         .map_err(|e| format!("Création de la webview du service échouée : {e}"))?;
     state.created.lock().unwrap().insert(service_id.to_string());
+    // URL d'accueil : cible du menu « Home », pour rattraper une webview partie ailleurs.
+    state
+        .homes
+        .lock()
+        .unwrap()
+        .insert(service_id.to_string(), url_str);
     Ok(())
 }
 
@@ -1186,6 +1229,7 @@ async fn delete_service(
     state.created.lock().unwrap().remove(&service_id);
     state.unread.lock().unwrap().remove(&service_id);
     state.flags.lock().unwrap().remove(&service_id);
+    state.homes.lock().unwrap().remove(&service_id);
     // Purge la session/cookies du service sur disque (fuite disque + vie privée sinon).
     purge_service_storage(&app, &service_id);
     Ok(())
@@ -1510,17 +1554,20 @@ fn toggle_main(app: &AppHandle) {
     }
 }
 
+// Webview du service actuellement affiché, s'il y en a un.
+fn active_service_webview(app: &AppHandle) -> Option<Webview<Wry>> {
+    let sid = app.state::<AppState>().active.lock().unwrap().clone()?;
+    app.get_webview(&format!("svc-{sid}"))
+}
+
 // Ouvre/ferme les devtools sur la webview du service actif (debug), puis repose le layout.
 fn toggle_devtools(app: &AppHandle) {
     // Disponible en release grâce à la feature `devtools` de Tauri (cf. Cargo.toml).
-    let active = app.state::<AppState>().active.lock().unwrap().clone();
-    if let Some(sid) = active {
-        if let Some(wv) = app.get_webview(&format!("svc-{sid}")) {
-            if wv.is_devtools_open() {
-                wv.close_devtools();
-            } else {
-                wv.open_devtools();
-            }
+    if let Some(wv) = active_service_webview(app) {
+        if wv.is_devtools_open() {
+            wv.close_devtools();
+        } else {
+            wv.open_devtools();
         }
     }
     reposition_active(app);
@@ -1528,11 +1575,34 @@ fn toggle_devtools(app: &AppHandle) {
 
 // Recharge la webview du service actif (comme « Reload service » de Ferdium).
 fn reload_active_service(app: &AppHandle) {
-    let active = app.state::<AppState>().active.lock().unwrap().clone();
-    if let Some(sid) = active {
-        if let Some(wv) = app.get_webview(&format!("svc-{sid}")) {
-            let _ = wv.reload();
-        }
+    if let Some(wv) = active_service_webview(app) {
+        let _ = wv.reload();
+    }
+}
+
+// Historique de la webview du service actif (menu Navigation). Une webview de service n'a
+// ni barre d'outils ni geste de retour : sans ça, une page qui en remplace une autre
+// (redirection d'auth, fichier affiché par la webview…) est un cul-de-sac.
+fn history_go(app: &AppHandle, delta: i32) {
+    if let Some(wv) = active_service_webview(app) {
+        let _ = wv.eval(format!("history.go({delta})"));
+    }
+}
+
+// Ramène le service actif sur son URL d'origine. Filet de sécurité quand l'historique ne
+// suffit pas — typiquement un document rendu par la webview elle-même (PDF, image…), qui
+// n'exécute pas de JS et où `history.back()` reste donc sans effet.
+fn go_home(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let Some(sid) = state.active.lock().unwrap().clone() else {
+        return;
+    };
+    let home = state.homes.lock().unwrap().get(&sid).cloned();
+    if let (Some(url), Some(wv)) = (
+        home.and_then(|h| Url::parse(&h).ok()),
+        app.get_webview(&format!("svc-{sid}")),
+    ) {
+        let _ = wv.navigate(url);
     }
 }
 
@@ -1797,6 +1867,24 @@ fn main() {
                         &devtools,
                     ],
                 )?;
+                // Sous-menu Navigation : ⌘[ / ⌘] comme Safari — surtout PAS ⌘←/⌘→, qui
+                // servent à se déplacer dans le texte des zones de saisie des services.
+                let back = MenuItem::with_id(app, "go-back", "Back", true, Some("CmdOrCtrl+["))?;
+                let forward =
+                    MenuItem::with_id(app, "go-forward", "Forward", true, Some("CmdOrCtrl+]"))?;
+                let home = MenuItem::with_id(
+                    app,
+                    "go-home",
+                    "Back to Service",
+                    true,
+                    Some("CmdOrCtrl+Shift+H"),
+                )?;
+                let navigation = Submenu::with_items(
+                    app,
+                    "Navigation",
+                    true,
+                    &[&back, &forward, &PredefinedMenuItem::separator(app)?, &home],
+                )?;
                 // Sous-menu Services : ⌘1..9 pour basculer (accélérateurs natifs -> fonctionnent
                 // même quand une webview de service a le focus, contrairement à un keydown JS).
                 let mut goto_items: Vec<MenuItem<Wry>> = Vec::new();
@@ -1814,7 +1902,8 @@ fn main() {
                     .map(|m| m as &dyn IsMenuItem<Wry>)
                     .collect();
                 let services_menu = Submenu::with_items(app, "Services", true, &goto_refs)?;
-                let menu = Menu::with_items(app, &[&app_sub, &edit, &view, &services_menu])?;
+                let menu =
+                    Menu::with_items(app, &[&app_sub, &edit, &view, &navigation, &services_menu])?;
                 app.set_menu(menu)?;
                 app.on_menu_event(|app, event| {
                     let id = event.id.as_ref();
@@ -1822,6 +1911,9 @@ fn main() {
                         "toggle-devtools" => toggle_devtools(app),
                         "reload-service" => reload_active_service(app),
                         "reload-app" => reload_app(app),
+                        "go-back" => history_go(app, -1),
+                        "go-forward" => history_go(app, 1),
+                        "go-home" => go_home(app),
                         _ => {
                             // goto-svc-N -> demande au shell d'afficher le Nᵉ service visible.
                             if let Some(n) = id
