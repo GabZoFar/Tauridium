@@ -12,6 +12,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-09-08
+### Fixed
+- **Downloading a file from ChatGPT replaced the service with the file.**
+  Unlike Safari, WKWebView ignores `Content-Disposition: attachment` and renders
+  the file inline whenever it knows the MIME type (PDF, images, text, CSV…), so
+  the service page was swapped for the document with no way back. Such responses
+  are now downloaded, and downloads keep the filename advertised by the server
+  (ChatGPT's signed links end in `file-…`, with no extension).
+### Added
+- **Navigation menu.** "Back" (⌘[), "Forward" (⌘]) and "Back to Service"
+  (⌘⇧H, reloads the service's own URL) — service webviews have no toolbar, so a
+  page that replaces another one used to be a dead end.
+
 ## [0.1.11] - 2026-08-21
 ### Fixed
 - **Linux: service webview covered the sidebar and only took half the height.**
