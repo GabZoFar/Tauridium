@@ -20,6 +20,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   catalog.
 - **Collapsible service rail.** Switch between compact service icons and an
   expanded sidebar with service names, workspaces, and account controls.
+- **Custom services.** Add any website as a service: type its name or address
+  in the catalog filter and choose "Create … as a custom service". Uses
+  Ferdium's Custom Website recipe, so it syncs with Ferdium accounts.
+- **Favicon icons.** "Use favicon as icon" now works: Tauridium fetches the
+  site's favicon (preferring SVG or the largest size) and caches it.
+  Custom services use it by default.
 
 ### Changed
 - Load services on demand by default instead of preloading every enabled web

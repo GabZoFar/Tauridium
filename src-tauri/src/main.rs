@@ -648,6 +648,234 @@ async fn recipe_webview_js(app_data: &Path, recipe_id: &str) -> Option<String> {
     Some(text)
 }
 
+// --- Favicons ------------------------------------------------------------
+
+// Attributs d'une balise HTML (`link rel="icon" href=…`), noms en minuscules.
+fn tag_attrs(tag: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let b = tag.as_bytes();
+    let mut i = 0;
+    // Saute le nom de la balise.
+    while i < b.len() && !b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < b.len() {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'/') {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'=' && b[i] != b'/' {
+            i += 1;
+        }
+        if start == i {
+            i += 1;
+            continue;
+        }
+        let name = tag[start..i].to_ascii_lowercase();
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < b.len() && b[i] == b'=' {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+                let quote = b[i];
+                i += 1;
+                let s = i;
+                while i < b.len() && b[i] != quote {
+                    i += 1;
+                }
+                value = tag[s..i].to_string();
+                i += 1;
+            } else {
+                let s = i;
+                while i < b.len() && !b[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                value = tag[s..i].to_string();
+            }
+        }
+        out.entry(name).or_insert(value);
+    }
+    out
+}
+
+// Icônes déclarées par une page, de la plus nette à la moins nette (SVG, puis plus
+// grande taille), avec /favicon.ico en dernier recours.
+fn favicon_candidates(html: &str, base: &Url) -> Vec<Url> {
+    // to_ascii_lowercase garde les mêmes offsets d'octets -> on peut indexer `html`.
+    let lower = html.to_ascii_lowercase();
+    let mut found: Vec<(u32, Url)> = Vec::new();
+    let mut pos = 0;
+    while let Some(off) = lower[pos..].find("<link") {
+        let start = pos + off;
+        let end = lower[start..].find('>').map_or(lower.len(), |e| start + e);
+        let attrs = tag_attrs(&html[start + 1..end]);
+        pos = end;
+        let rel = attrs
+            .get("rel")
+            .map(|r| r.to_ascii_lowercase())
+            .unwrap_or_default();
+        let touch = rel
+            .split_whitespace()
+            .any(|t| t.starts_with("apple-touch-icon"));
+        if !touch && !rel.split_whitespace().any(|t| t == "icon") {
+            continue;
+        }
+        let Some(href) = attrs
+            .get("href")
+            .map(|h| h.trim().replace("&amp;", "&"))
+            .filter(|h| !h.is_empty())
+        else {
+            continue;
+        };
+        let Ok(url) = base.join(&href) else { continue };
+        let svg =
+            attrs.get("type").is_some_and(|t| t.contains("svg")) || url.path().ends_with(".svg");
+        let size = attrs.get("sizes").and_then(|s| {
+            s.split_whitespace()
+                .filter_map(|d| d.split(['x', 'X']).next()?.parse::<u32>().ok())
+                .max()
+        });
+        let score = if svg {
+            1000
+        } else {
+            size.unwrap_or(if touch { 180 } else { 16 })
+        };
+        found.push((score, url));
+    }
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    let mut out: Vec<Url> = found.into_iter().map(|(_, u)| u).collect();
+    if let Ok(ico) = base.join("/favicon.ico") {
+        if !out.contains(&ico) {
+            out.push(ico);
+        }
+    }
+    out
+}
+
+// Type MIME d'une image d'après ses premiers octets (serveurs qui renvoient text/html).
+fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0, 0, 1, 0]) {
+        Some("image/x-icon")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if bytes.starts_with(&[0xFF, 0xD8]) {
+        Some("image/jpeg")
+    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).contains("<svg") {
+        Some("image/svg+xml")
+    } else {
+        None
+    }
+}
+
+// Télécharge une icône et la renvoie en data URL (affichable sans requête côté UI).
+async fn fetch_icon(url: &Url) -> Option<String> {
+    if url.scheme() == "data" {
+        return url
+            .as_str()
+            .starts_with("data:image/")
+            .then(|| url.to_string());
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let res = HTTP
+        .clone()
+        .get(url.as_str())
+        .header(reqwest::header::USER_AGENT, SERVICE_UA)
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let declared = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|m| m.starts_with("image/"));
+    let bytes = res.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > 1_000_000 {
+        return None;
+    }
+    let mime = declared.or_else(|| sniff_image(&bytes).map(str::to_string))?;
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+// Favicon du site d'un service (data URL), mis en cache sur disque par hôte.
+// None si le site n'expose aucune icône exploitable.
+#[tauri::command]
+async fn service_favicon(
+    app: AppHandle,
+    recipe_id: String,
+    custom_url: Option<String>,
+    team: Option<String>,
+) -> Result<Option<String>, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let cfg = recipe_config(&app_data, &recipe_id).await?;
+    let url_str = resolve_url(&cfg, custom_url.as_deref(), team.as_deref())?;
+    let page = Url::parse(&url_str).map_err(|e| format!("URL invalide « {url_str} » : {e}"))?;
+    let host: String = page
+        .host_str()
+        .ok_or("URL sans hôte")?
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = app_data.join("favicons");
+    let cache = dir.join(format!("{host}.txt"));
+    if let Ok(cached) = std::fs::read_to_string(&cache) {
+        return Ok(Some(cached));
+    }
+
+    // La page peut rediriger (login…) : les href relatifs se résolvent sur l'URL finale.
+    let (html, base) = match HTTP
+        .clone()
+        .get(page.as_str())
+        .header(reqwest::header::USER_AGENT, SERVICE_UA)
+        .send()
+        .await
+    {
+        Ok(res) => {
+            let base = res.url().clone();
+            (res.text().await.unwrap_or_default(), base)
+        }
+        Err(_) => (String::new(), page),
+    };
+    for candidate in favicon_candidates(&html, &base).iter().take(5) {
+        if let Some(icon) = fetch_icon(candidate).await {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = write_atomic(&cache, &icon);
+            return Ok(Some(icon));
+        }
+    }
+    Ok(None)
+}
+
 // --- Webviews de services ----------------------------------------------
 
 // Les 16 octets de l'UUID du service -> identifiant de data store WKWebView.
@@ -1966,6 +2194,54 @@ mod tests {
     }
 
     #[test]
+    fn favicon_candidates_prefers_svg_then_largest_then_ico() {
+        let base = Url::parse("https://www.example.com/app/").unwrap();
+        let html = r#"<head>
+            <LINK rel="shortcut icon" href="/small.ico">
+            <link href='icons/big.png' sizes="192x192" rel=icon>
+            <link rel="apple-touch-icon" href="https://cdn.example.com/touch.png">
+            <link rel="mask-icon" href="/mask.svg">
+            <link rel="stylesheet" href="/style.css">
+            <link rel="icon" type="image/svg+xml" href="/logo.svg?v=1&amp;x=2">
+        </head>"#;
+        let got: Vec<String> = favicon_candidates(html, &base)
+            .iter()
+            .map(Url::to_string)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "https://www.example.com/logo.svg?v=1&x=2",
+                "https://www.example.com/app/icons/big.png",
+                "https://cdn.example.com/touch.png",
+                "https://www.example.com/small.ico",
+                "https://www.example.com/favicon.ico",
+            ]
+        );
+    }
+
+    #[test]
+    fn favicon_candidates_falls_back_to_favicon_ico() {
+        let base = Url::parse("https://example.com/login").unwrap();
+        let got: Vec<String> = favicon_candidates("", &base)
+            .iter()
+            .map(Url::to_string)
+            .collect();
+        assert_eq!(got, vec!["https://example.com/favicon.ico"]);
+    }
+
+    #[test]
+    fn sniff_image_detects_common_formats() {
+        assert_eq!(sniff_image(b"\x89PNG\r\n"), Some("image/png"));
+        assert_eq!(sniff_image(&[0, 0, 1, 0, 1]), Some("image/x-icon"));
+        assert_eq!(
+            sniff_image(b"<?xml?><svg xmlns=''/>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(sniff_image(b"<!doctype html><html>"), None);
+    }
+
+    #[test]
     fn ensure_scheme_prepends_https_when_missing() {
         assert_eq!(ensure_scheme("example.com"), "https://example.com");
         assert_eq!(ensure_scheme("https://example.com"), "https://example.com");
@@ -2267,6 +2543,7 @@ fn main() {
             delete_service,
             clear_service_cache,
             list_recipes,
+            service_favicon,
             create_workspace,
             update_workspace,
             delete_workspace,
