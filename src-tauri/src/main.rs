@@ -232,6 +232,51 @@ fn local_user() -> Value {
     })
 }
 
+// Nom lisible d'une recette d'après son id : « amazon-web-services » -> « Amazon Web Services ».
+fn recipe_display_name(recipe_id: &str) -> String {
+    recipe_id
+        .split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            chars.next().map_or(String::new(), |c| {
+                c.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// Vrai nom d'une recette (« WhatsApp ») depuis son package.json s'il est déjà en cache.
+fn cached_recipe_name(app_data: &Path, recipe_id: &str) -> Option<String> {
+    let text =
+        std::fs::read_to_string(app_data.join("recipes").join(format!("{recipe_id}.json"))).ok()?;
+    let cfg: Value = serde_json::from_str(&text).ok()?;
+    cfg.get("name")?.as_str().map(str::to_string)
+}
+
+// Les services locaux créés avant ce correctif portent le nom brut du catalogue
+// (« whatsapp ») : on leur donne le nom de la recette. Renvoie true si modifié.
+fn fix_local_service_names(data: &mut LocalData, app_data: &Path) -> bool {
+    let mut changed = false;
+    for service in &mut data.services {
+        let Some(recipe_id) = service.get("recipeId").and_then(Value::as_str) else {
+            continue;
+        };
+        let raw = recipe_id.replace(['-', '_'], " ");
+        if service.get("name").and_then(Value::as_str) != Some(raw.as_str()) {
+            continue;
+        }
+        let name = cached_recipe_name(app_data, recipe_id)
+            .unwrap_or_else(|| recipe_display_name(recipe_id));
+        if name != raw {
+            service["name"] = Value::String(name);
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn remove_local_service(data: &mut LocalData, service_id: &str) -> Result<(), String> {
     let before = data.services.len();
     data.services
@@ -435,9 +480,13 @@ fn current(state: &State<'_, AppState>) -> Result<(String, String), String> {
 async fn get_services(app: AppHandle, state: State<'_, AppState>) -> Result<Value, String> {
     if is_local(&state) {
         let _guard = state.local_data_lock.lock().unwrap();
-        return Ok(serde_json::json!(
-            read_local_data(&local_data_path(&app)?)?.services
-        ));
+        let path = local_data_path(&app)?;
+        let mut data = read_local_data(&path)?;
+        let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        if fix_local_service_names(&mut data, &app_data) {
+            write_local_data(&path, &data)?;
+        }
+        return Ok(serde_json::json!(data.services));
     }
     let (base, token) = current(&state)?;
     api_get(&base, &token, "/v1/me/services").await
@@ -1576,6 +1625,17 @@ async fn create_service(
         {
             return Err("Invalid recipe ID".into());
         }
+        // Nom par défaut du catalogue -> vrai nom de la recette (« Whatsapp » -> « WhatsApp »).
+        let name = if name == recipe_display_name(&recipe_id) {
+            let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            recipe_config(&app_data, &recipe_id)
+                .await
+                .ok()
+                .and_then(|cfg| cfg.get("name")?.as_str().map(str::to_string))
+                .unwrap_or(name)
+        } else {
+            name
+        };
         return mutate_local_data(&app, &state, |data| {
             let service = serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
@@ -1678,6 +1738,15 @@ async fn list_recipes(app: AppHandle, state: State<'_, AppState>) -> Result<Valu
             .and_then(|m| m.modified())
             .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
             .is_ok_and(|age| age < Duration::from_secs(24 * 60 * 60));
+        // Le cache a pu être écrit avec les anciens noms en minuscules : on les recalcule.
+        let cached = cached.map(|mut catalog| {
+            for entry in catalog.as_array_mut().into_iter().flatten() {
+                if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                    entry["name"] = Value::String(recipe_display_name(id));
+                }
+            }
+            catalog
+        });
         if fresh {
             if let Some(catalog) = cached.as_ref() {
                 return Ok(catalog.clone());
@@ -1699,7 +1768,7 @@ async fn list_recipes(app: AppHandle, state: State<'_, AppState>) -> Result<Valu
                     .filter_map(|entry| entry.get("name").and_then(Value::as_str))
                     .map(|id| serde_json::json!({
                         "id": id,
-                        "name": id.replace(['-', '_'], " "),
+                        "name": recipe_display_name(id),
                         "icons": { "svg": format!("https://raw.githubusercontent.com/ferdium/ferdium-recipes/main/recipes/{id}/icon.svg") }
                     }))
                     .collect();
@@ -2169,6 +2238,43 @@ mod tests {
         std::fs::write(&path, "{bad json").unwrap();
         assert!(read_local_data(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recipe_display_name_capitalizes_each_word() {
+        assert_eq!(
+            recipe_display_name("amazon-web-services"),
+            "Amazon Web Services"
+        );
+        assert_eq!(recipe_display_name("1password"), "1password");
+        assert_eq!(recipe_display_name("alibaba_chat"), "Alibaba Chat");
+        assert_eq!(recipe_display_name("80lv"), "80lv");
+    }
+
+    #[test]
+    fn fix_local_service_names_only_renames_raw_catalog_names() {
+        let mut data = LocalData {
+            services: vec![
+                json!({ "id": "a", "recipeId": "whatsapp", "name": "whatsapp" }),
+                json!({ "id": "b", "recipeId": "amazon-web-services", "name": "amazon web services" }),
+                json!({ "id": "c", "recipeId": "slack", "name": "my team" }),
+            ],
+            workspaces: vec![],
+        };
+        assert!(fix_local_service_names(
+            &mut data,
+            Path::new("/nonexistent")
+        ));
+        let names: Vec<&str> = data
+            .services
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["Whatsapp", "Amazon Web Services", "my team"]);
+        assert!(!fix_local_service_names(
+            &mut data,
+            Path::new("/nonexistent")
+        ));
     }
 
     #[test]

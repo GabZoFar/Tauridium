@@ -32,6 +32,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   app. Services already opened keep running for notifications.
 - Check recipe badges every five seconds and avoid sending unchanged unread
   counts to the shell.
+- Show capitalized service names in local mode ("Amazon Web Services",
+  "WhatsApp") in the catalog and the rail; existing local services are renamed
+  automatically unless you gave them a custom name.
 
 ## [0.1.12] - 2026-09-08
 ### Fixed
